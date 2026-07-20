@@ -72,4 +72,12 @@ npm run build         # production build
 npm run start         # serve production build
 npm run lint
 npm run verify:agent  # mocked LLM unit check
+npm run run:20-emails # demo corpus through analyzeEmail (+ Overmind traces)
 ```
+
+## Overmind telemetry
+
+When `OVERMIND_API_KEY` is set, each `analyzeEmail` call exports one OTLP trace to
+Overmind (`entry_point` harness span + child `llm_call` with raw extraction JSON).
+Tracing is a no-op if the key is unset. See `.env.example` for optional
+`OVERMIND_AGENT_ID` / `OVERMIND_AGENT_NAME` / `OVERMIND_ENVIRONMENT`.

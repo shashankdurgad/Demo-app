@@ -38,25 +38,26 @@ if (!process.env.OPENAI_API_KEY && !process.env.OLLAMA_BASE_URL) {
   process.exit(1);
 }
 
-const { DEMO_EMAILS } = await import("../src/lib/demo-emails.ts");
+const count = Number(process.env.DEMO_EMAIL_COUNT || 250);
+const { generateDemoEmails } = await import("../src/lib/generate-demo-emails.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
-const { forceFlushTraces, initTelemetry, isTelemetryEnabled } = await import(
-  "../src/lib/telemetry.ts"
-);
+const { flushTraces, forceFlushTraces, initTelemetry, isTelemetryEnabled } =
+  await import("../src/lib/telemetry.ts");
 
 initTelemetry();
 
-if (DEMO_EMAILS.length !== 20) {
+const emails = generateDemoEmails(count);
+if (emails.length !== count) {
   console.error(
-    `Hard failure: expected exactly 20 demo emails, found ${DEMO_EMAILS.length}`,
+    `Hard failure: expected ${count} generated emails, found ${emails.length}`,
   );
   process.exit(1);
 }
 
 const status = getLlmStatus();
 console.log(
-  `Running ${DEMO_EMAILS.length} emails through analyzeEmail (${status.provider}/${status.model})…`,
+  `Running ${emails.length} generated emails through analyzeEmail (${status.provider}/${status.model})…`,
 );
 console.log(
   isTelemetryEnabled()
@@ -65,8 +66,10 @@ console.log(
 );
 
 const rows = [];
+const started = Date.now();
 
-for (const email of DEMO_EMAILS) {
+for (let i = 0; i < emails.length; i += 1) {
+  const email = emails[i];
   let record;
   try {
     record = await analyzeEmail(email, "demo");
@@ -81,20 +84,40 @@ for (const email of DEMO_EMAILS) {
     emailId: email.id,
     subject: email.subject,
     isInvoice: Boolean(record),
-    harnessOutput: record,
+    confidence: record?.confidence ?? null,
+    vendor: record?.vendor ?? null,
+    amount: record?.amount?.raw ?? null,
+    dueDate: record?.dueDate ?? null,
   };
   rows.push(row);
-  console.log(JSON.stringify(row, null, 2));
-  console.log("---");
+
+  const n = i + 1;
+  if (n % 25 === 0 || n === emails.length) {
+    const invoiceSoFar = rows.filter((r) => r.isInvoice).length;
+    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(
+      `  [${n}/${emails.length}] invoices=${invoiceSoFar} elapsed=${elapsedSec}s last=${email.id} isInvoice=${row.isInvoice}`,
+    );
+    // Periodic flush so short-lived crashes don't lose a large batch.
+    await flushTraces();
+  }
 }
 
 const invoiceRows = rows.filter((row) => row.isInvoice);
 console.log("\nSummary");
-console.log(`  Scanned: ${DEMO_EMAILS.length}`);
+console.log(`  Scanned: ${emails.length}`);
 console.log(`  Classified as invoices: ${invoiceRows.length}`);
 console.log(
-  `  Rejected / non-invoices: ${DEMO_EMAILS.length - invoiceRows.length}`,
+  `  Rejected / non-invoices: ${emails.length - invoiceRows.length}`,
 );
+console.log(`  Elapsed: ${((Date.now() - started) / 1000).toFixed(1)}s`);
+
+console.log("\nSample invoices (first 10):");
+for (const row of invoiceRows.slice(0, 10)) {
+  console.log(
+    `  • ${row.vendor}: ${row.amount}, due ${row.dueDate} (confidence ${row.confidence})`,
+  );
+}
 
 await forceFlushTraces();
 process.exit(0);

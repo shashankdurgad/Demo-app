@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { withLlmCallSpan } from "@/lib/telemetry";
 
 const LlmExtractionSchema = z.object({
   isInvoice: z.boolean(),
@@ -83,9 +84,22 @@ Rules:
 - currency must be an ISO code like USD, GBP, EUR when known.
 - dueDate must be YYYY-MM-DD when known, else null.
 - Prefer explicit "amount due" / "total" / "balance due" over subtotals or tax lines.
-- If uncertain, lower confidence and set isInvoice=false unless evidence is strong.
-- confidence must be a number between 0 and 1 (not a percentage).
-- Return JSON only. No markdown.`;
+- If uncertain whether it is a payable invoice, set isInvoice=false unless evidence is strong.
+
+Confidence (required):
+- Grade confidence from 0.0 to 1.0 on how sure you are that your full extraction is correct
+  (isInvoice decision + extracted fields that you populated).
+- Use a decimal in [0, 1], never a percentage (e.g. 0.82 not 82).
+- Calibrate roughly as:
+  - 0.90–1.00: clear payable invoice (or clear non-invoice) with explicit amount/due date or unambiguous rejection cues
+  - 0.70–0.89: likely correct, but a field is missing, ambiguous, or inferred
+  - 0.40–0.69: mixed signals (receipt vs invoice, partial bill, weak vendor/amount evidence)
+  - 0.00–0.39: guessing; content is sparse, contradictory, or mostly unrelated
+- Lower confidence when amount/due date/vendor are guessed, when paid receipts look like invoices, or when multiple totals conflict.
+- Higher confidence when the email explicitly says invoice/bill/amount due and fields are stated plainly.
+- Do not default every answer to 0.9+; spread scores when evidence strength differs.
+
+Return JSON only. No markdown.`;
 
 const extractJsonObject = (content: string) => {
   const trimmed = content.trim();
@@ -107,6 +121,7 @@ export const analyzeEmailWithLlm = async (input: {
   text: string;
 }): Promise<LlmExtraction> => {
   const endpoint = getLlmEndpoint();
+  const temperature = 0;
 
   const userPrompt = `Analyze this email for accounting invoice triage.
 
@@ -122,52 +137,89 @@ Return ONLY valid JSON with exactly these keys:
   "confidence": number
 }
 
+For "confidence": score 0.0–1.0 for how confident you are in this triage + extraction
+(not how likely the email is an invoice by itself). Example: a clear newsletter can be
+isInvoice=false with confidence 0.95; a blurry maybe-invoice might be isInvoice=false
+with confidence 0.45.
+
 Email date: ${input.date}
 Email subject: ${input.subject}
 From: ${input.from}
 Body / attachments text:
 ${input.text.slice(0, 10000)}`;
 
-  const response = await fetch(endpoint.url, {
-    method: "POST",
-    headers: endpoint.headers,
-    body: JSON.stringify({
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: userPrompt },
+  ];
+
+  return withLlmCallSpan(
+    {
+      name: "analyzeEmailWithLlm",
       model: endpoint.model,
-      temperature: 0,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: { type: "json_object" },
-    }),
-  });
+      provider: endpoint.provider,
+      messages,
+      temperature,
+    },
+    async () => {
+      const response = await fetch(endpoint.url, {
+        method: "POST",
+        headers: endpoint.headers,
+        body: JSON.stringify({
+          model: endpoint.model,
+          temperature,
+          messages,
+          response_format: { type: "json_object" },
+        }),
+      });
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
-    );
-  }
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(
+          `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
+        );
+      }
 
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error("LLM returned an empty response.");
-  }
+      const data = (await response.json()) as {
+        model?: string;
+        choices?: Array<{
+          finish_reason?: string;
+          message?: { content?: string };
+        }>;
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+        };
+      };
 
-  const parsed = extractJsonObject(content) as Record<string, unknown>;
+      // Capture the TRUE raw model surface before any Zod / normalization.
+      const rawContent = data.choices?.[0]?.message?.content;
+      if (!rawContent) {
+        throw new Error("LLM returned an empty response.");
+      }
 
-  // Some models return confidence as 0–100; normalize to 0–1 for the schema.
-  if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
-    parsed.confidence = Math.min(parsed.confidence / 100, 1);
-  }
+      const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
 
-  const result = LlmExtractionSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new Error(`LLM returned invalid invoice JSON: ${result.error.message}`);
-  }
+      // Some models return confidence as 0–100; normalize to 0–1 for the schema.
+      if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
+        parsed.confidence = Math.min(parsed.confidence / 100, 1);
+      }
 
-  return result.data;
+      const result = LlmExtractionSchema.safeParse(parsed);
+      if (!result.success) {
+        throw new Error(
+          `LLM returned invalid invoice JSON: ${result.error.message}`,
+        );
+      }
+
+      return {
+        result: result.data,
+        rawContent,
+        usage: data.usage,
+        responseModel: data.model,
+        finishReason: data.choices?.[0]?.finish_reason,
+      };
+    },
+  );
 };

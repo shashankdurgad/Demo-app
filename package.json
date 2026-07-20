@@ -8,9 +8,17 @@
     "start": "next start",
     "lint": "eslint",
     "verify:agent": "tsx scripts/verify-agent.mjs",
-    "run:20-emails": "tsx scripts/run-20-emails.mjs"
+    "run:20-emails": "tsx scripts/run-20-emails.mjs",
+    "run:250-emails": "tsx scripts/run-250-emails.mjs"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/context-async-hooks": "^2.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.220.0",
+    "@opentelemetry/resources": "^2.9.0",
+    "@opentelemetry/sdk-trace-base": "^2.9.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
     "google-auth-library": "^10.9.0",
     "googleapis": "^173.0.0",
     "iron-session": "^8.0.4",

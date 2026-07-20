@@ -4,7 +4,10 @@ import { runInvoiceAgent } from "@/lib/agent/triage";
 import { DEMO_EMAILS } from "@/lib/demo-emails";
 import { fetchCandidateEmails } from "@/lib/gmail";
 import { getSession } from "@/lib/session";
+import { flushTraces } from "@/lib/telemetry";
 import type { ScanResult } from "@/lib/types";
+
+export const runtime = "nodejs";
 
 export const POST = async (request: NextRequest) => {
   if (!isLlmConfigured()) {
@@ -33,6 +36,7 @@ export const POST = async (request: NextRequest) => {
         mode: "demo",
         scannedAt: new Date().toISOString(),
       };
+      await flushTraces();
       return NextResponse.json(result);
     }
 
@@ -54,10 +58,12 @@ export const POST = async (request: NextRequest) => {
       mode: "gmail",
       scannedAt: new Date().toISOString(),
     };
+    await flushTraces();
     return NextResponse.json(result);
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Failed to run invoice LLM agent";
+    await flushTraces();
     return NextResponse.json({ error: message }, { status: 500 });
   }
 };
