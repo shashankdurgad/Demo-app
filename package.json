@@ -9,7 +9,9 @@
     "lint": "eslint",
     "verify:agent": "tsx scripts/verify-agent.mjs",
     "run:20-emails": "tsx scripts/run-20-emails.mjs",
-    "run:250-emails": "tsx scripts/run-250-emails.mjs"
+    "run:250-emails": "tsx scripts/run-250-emails.mjs",
+    "run:eval-50": "tsx scripts/run-eval-50.mjs",
+    "run:eval-50b": "tsx scripts/run-eval-50b.mjs"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
