@@ -1,6 +1,6 @@
 import type { RawEmail } from "@/lib/gmail";
 import { analyzeEmailWithLlm, requireLlmConfigured } from "@/lib/agent/llm";
-import { withEntryPointSpan } from "@/lib/telemetry";
+import { withBatchSpan, withEntryPointSpan } from "@/lib/telemetry";
 import type { InvoiceRecord } from "@/lib/types";
 
 const toGmailUrl = (emailId: string, source: "gmail" | "demo") =>
@@ -66,18 +66,25 @@ export const runInvoiceAgent = async (
 ) => {
   requireLlmConfigured();
 
-  const invoices: InvoiceRecord[] = [];
+  // withBatchSpan is a no-op unless OVERMIND_NEST_ENTRY_POINTS=1.
+  return withBatchSpan(
+    "runInvoiceAgent",
+    { source, emailCount: emails.length },
+    async () => {
+      const invoices: InvoiceRecord[] = [];
 
-  for (const email of emails) {
-    const record = await analyzeEmail(email, source);
-    if (record) invoices.push(record);
-  }
+      for (const email of emails) {
+        const record = await analyzeEmail(email, source);
+        if (record) invoices.push(record);
+      }
 
-  invoices.sort((a, b) => {
-    const aDue = a.dueDate || "9999-12-31";
-    const bDue = b.dueDate || "9999-12-31";
-    return aDue.localeCompare(bDue);
-  });
+      invoices.sort((a, b) => {
+        const aDue = a.dueDate || "9999-12-31";
+        const bDue = b.dueDate || "9999-12-31";
+        return aDue.localeCompare(bDue);
+      });
 
-  return invoices;
+      return invoices;
+    },
+  );
 };

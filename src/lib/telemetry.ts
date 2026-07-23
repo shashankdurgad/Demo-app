@@ -30,6 +30,17 @@ let initialized = false;
 
 export const isTelemetryEnabled = () => Boolean(process.env.OVERMIND_API_KEY);
 
+/**
+ * Experimental: nest each analyzeEmail entry_point under an active batch parent
+ * instead of starting a new root per email. Used to repro Overmind live-scoring
+ * bugs on multi-invocation trees. Default OFF (production-safe).
+ * Set OVERMIND_NEST_ENTRY_POINTS=1 to enable.
+ */
+export const isNestEntryPointsEnabled = () => {
+  const raw = process.env.OVERMIND_NEST_ENTRY_POINTS?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+};
+
 const jsonStringify = (value: unknown) => {
   try {
     return JSON.stringify(value, (_key, v) =>
@@ -241,8 +252,11 @@ export type LlmCallResult<T> = {
 };
 
 /**
- * Root entry_point span for one email (one email → one trace → one datapoint).
- * Starts under ROOT_CONTEXT so a scan loop never nests emails into one trace.
+ * Default: root entry_point per email (ROOT_CONTEXT) — one email → one trace.
+ *
+ * Experimental (`OVERMIND_NEST_ENTRY_POINTS=1`): if a parent span is already
+ * active (e.g. batchScan), nest this entry_point under it so many analyzeEmail
+ * spans share one structural root. Easy to revert — leave the flag unset.
  */
 export const withEntryPointSpan = async <T>(
   name: string,
@@ -252,9 +266,51 @@ export const withEntryPointSpan = async <T>(
   const tracer = getTracer();
   if (!tracer) return fn();
 
-  const span = tracer.startSpan(name, undefined, ROOT_CONTEXT);
+  const active = context.active();
+  const parentSpan = trace.getSpan(active);
+  const nestUnderParent =
+    isNestEntryPointsEnabled() && parentSpan != null;
+  const parentContext = nestUnderParent ? active : ROOT_CONTEXT;
+
+  const span = tracer.startSpan(name, undefined, parentContext);
   const startMs = Date.now();
   span.setAttribute("overmind.span.type", "entry_point");
+  stampIdentity(span);
+  span.setAttribute("inputs", jsonStringify(inputs));
+
+  return context.with(trace.setSpan(parentContext, span), async () => {
+    try {
+      const result = await fn();
+      span.setAttribute("outputs", jsonStringify(result));
+      finalizeSpan(span, startMs, null);
+      return result;
+    } catch (error) {
+      finalizeSpan(span, startMs, error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+};
+
+/**
+ * Batch/scan parent — structural root when nesting is enabled.
+ * No-op when OVERMIND_NEST_ENTRY_POINTS is off (keeps default one-root-per-email).
+ */
+export const withBatchSpan = async <T>(
+  name: string,
+  inputs: unknown,
+  fn: () => Promise<T>,
+): Promise<T> => {
+  if (!isNestEntryPointsEnabled()) return fn();
+
+  const tracer = getTracer();
+  if (!tracer) return fn();
+
+  // Always the sole structural root for a nested scan.
+  const span = tracer.startSpan(name, undefined, ROOT_CONTEXT);
+  const startMs = Date.now();
+  span.setAttribute("overmind.span.type", "batch");
   stampIdentity(span);
   span.setAttribute("inputs", jsonStringify(inputs));
 
