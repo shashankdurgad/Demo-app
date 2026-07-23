@@ -8,6 +8,10 @@ const toGmailUrl = (emailId: string, source: "gmail" | "demo") =>
     ? "#"
     : `https://mail.google.com/mail/u/0/#inbox/${emailId}`;
 
+/**
+ * One email → one entry_point root. Nested LLM steps (classify → extract|reject →
+ * finalize) must stay under this span so Overmind sees multiple llm_call children.
+ */
 export const analyzeEmail = async (
   email: RawEmail,
   source: "gmail" | "demo",

@@ -60,8 +60,11 @@ Tokens are stored in an encrypted httpOnly session cookie on your machine.
 ## How the agent works
 
 1. Loads recent inbox emails (+ PDF attachment text when present)
-2. Sends each email to the LLM for triage + extraction
-3. Keeps only messages the model marks as payable invoices
+2. For **every** email, runs a fixed 3-step LLM pipeline under one harness call:
+   - **classify** — payable invoice?
+   - **extract** (invoice) or **explain rejection** (non-invoice) — always a 2nd model call
+   - **finalize** — short AP note / next action (always a 3rd model call)
+3. Keeps only messages marked as payable invoices for the UI
 4. Shows vendor, amount, due date, invoice number, and confidence
 
 ## Scripts
@@ -77,7 +80,15 @@ npm run run:20-emails # demo corpus through analyzeEmail (+ Overmind traces)
 
 ## Overmind telemetry
 
-When `OVERMIND_API_KEY` is set, each `analyzeEmail` call exports one OTLP trace to
-Overmind (`entry_point` harness span + child `llm_call` with raw extraction JSON).
-Tracing is a no-op if the key is unset. See `.env.example` for optional
-`OVERMIND_AGENT_ID` / `OVERMIND_AGENT_NAME` / `OVERMIND_ENVIRONMENT`.
+When `OVERMIND_API_KEY` is set, each `analyzeEmail` exports **one** OTLP root trace
+(`entry_point`) with **3 nested `llm_call` children** (classify → extract|reject →
+finalize), including for non-invoices. Tracing is a no-op if the key is unset.
+
+Required for live scoring: `OVERMIND_AGENT_NAME` / `OVERMIND_AGENT_ID` (and usually
+`OVERMIND_PROJECT_ID`). Local ingest: `OVERMIND_API_URL=http://localhost:8000`.
+
+**Success check for multi-call scoring load gen** (`npm run run:20-emails`):
+
+- Script prints 20 rows and exits 0
+- Overmind shows ~20 new roots for this agent
+- Each root has one `entry_point` and **3** `llm_call` children (never a single-call tree)
