@@ -14,37 +14,6 @@ const LlmExtractionSchema = z.object({
 
 export type LlmExtraction = z.infer<typeof LlmExtractionSchema>;
 
-const ClassifySchema = z.object({
-  isInvoice: z.boolean(),
-  summary: z.string().nullable(),
-  confidence: z.number().min(0).max(1),
-});
-
-const ExtractSchema = z.object({
-  vendor: z.string().nullable(),
-  amount: z.number().nullable(),
-  currency: z.string().nullable(),
-  dueDate: z.string().nullable(),
-  invoiceNumber: z.string().nullable(),
-  summary: z.string().nullable(),
-  confidence: z.number().min(0).max(1),
-});
-
-const RejectSchema = z.object({
-  vendor: z.string().nullable().optional(),
-  amount: z.number().nullable().optional(),
-  currency: z.string().nullable().optional(),
-  dueDate: z.string().nullable().optional(),
-  invoiceNumber: z.string().nullable().optional(),
-  summary: z.string().nullable(),
-  confidence: z.number().min(0).max(1),
-  rationale: z.string(),
-});
-
-const FinalizeSchema = z.object({
-  apNote: z.string().min(1),
-});
-
 export type LlmEndpoint = {
   provider: "openai" | "ollama";
   url: string;
@@ -105,19 +74,32 @@ export const getLlmStatus = () => {
   };
 };
 
-type EmailInput = {
-  subject: string;
-  from: string;
-  date: string;
-  text: string;
-};
+const SYSTEM_PROMPT = `You are Ledgerline, an accounting invoice triage agent.
+You ONLY decide from email content whether the message is a payable invoice / bill for accounting, and extract structured fields.
 
-const emailBlock = (input: EmailInput) =>
-  `Email date: ${input.date}
-Email subject: ${input.subject}
-From: ${input.from}
-Body / attachments text:
-${input.text.slice(0, 8000)}`;
+Rules:
+- isInvoice=true only for unpaid/payable invoices, bills, or statements with an amount owed.
+- isInvoice=false for receipts already paid, marketing, newsletters, personal chat, shipping notices without a bill, and unrelated mail.
+- amount must be the total amount due (number only, no currency symbols).
+- currency must be an ISO code like USD, GBP, EUR when known.
+- dueDate must be YYYY-MM-DD when known, else null.
+- Prefer explicit "amount due" / "total" / "balance due" over subtotals or tax lines.
+- If uncertain whether it is a payable invoice, set isInvoice=false unless evidence is strong.
+
+Confidence (required):
+- Grade confidence from 0.0 to 1.0 on how sure you are that your full extraction is correct
+  (isInvoice decision + extracted fields that you populated).
+- Use a decimal in [0, 1], never a percentage (e.g. 0.82 not 82).
+- Calibrate roughly as:
+  - 0.90–1.00: clear payable invoice (or clear non-invoice) with explicit amount/due date or unambiguous rejection cues
+  - 0.70–0.89: likely correct, but a field is missing, ambiguous, or inferred
+  - 0.40–0.69: mixed signals (receipt vs invoice, partial bill, weak vendor/amount evidence)
+  - 0.00–0.39: guessing; content is sparse, contradictory, or mostly unrelated
+- Lower confidence when amount/due date/vendor are guessed, when paid receipts look like invoices, or when multiple totals conflict.
+- Higher confidence when the email explicitly says invoice/bill/amount due and fields are stated plainly.
+- Do not default every answer to 0.9+; spread scores when evidence strength differs.
+
+Return JSON only. No markdown.`;
 
 const extractJsonObject = (content: string) => {
   const trimmed = content.trim();
@@ -132,28 +114,48 @@ const extractJsonObject = (content: string) => {
   return JSON.parse(match[0]) as unknown;
 };
 
-const normalizeConfidence = (parsed: Record<string, unknown>) => {
-  if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
-    parsed.confidence = Math.min(parsed.confidence / 100, 1);
-  }
-};
-
-const callLlmJson = async <T>(
-  spanName: string,
-  system: string,
-  user: string,
-  schema: z.ZodType<T>,
-): Promise<T> => {
+export const analyzeEmailWithLlm = async (input: {
+  subject: string;
+  from: string;
+  date: string;
+  text: string;
+}): Promise<LlmExtraction> => {
   const endpoint = getLlmEndpoint();
   const temperature = 0;
+
+  const userPrompt = `Analyze this email for accounting invoice triage.
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "isInvoice": boolean,
+  "vendor": string|null,
+  "amount": number|null,
+  "currency": string|null,
+  "dueDate": "YYYY-MM-DD"|null,
+  "invoiceNumber": string|null,
+  "summary": string|null,
+  "confidence": number
+}
+
+For "confidence": score 0.0–1.0 for how confident you are in this triage + extraction
+(not how likely the email is an invoice by itself). Example: a clear newsletter can be
+isInvoice=false with confidence 0.95; a blurry maybe-invoice might be isInvoice=false
+with confidence 0.45.
+
+Email date: ${input.date}
+Email subject: ${input.subject}
+From: ${input.from}
+Body / attachments text:
+${input.text.slice(0, 10000)}`;
+
   const messages = [
-    { role: "system", content: system },
-    { role: "user", content: user },
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: userPrompt },
   ];
 
   return withLlmCallSpan(
     {
-      name: spanName,
+      name: "analyzeEmailWithLlm",
       model: endpoint.model,
       provider: endpoint.provider,
       messages,
@@ -191,18 +193,23 @@ const callLlmJson = async <T>(
         };
       };
 
+      // Capture the TRUE raw model surface before any Zod / normalization.
       const rawContent = data.choices?.[0]?.message?.content;
       if (!rawContent) {
         throw new Error("LLM returned an empty response.");
       }
 
       const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
-      normalizeConfidence(parsed);
 
-      const result = schema.safeParse(parsed);
+      // Some models return confidence as 0–100; normalize to 0–1 for the schema.
+      if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
+        parsed.confidence = Math.min(parsed.confidence / 100, 1);
+      }
+
+      const result = LlmExtractionSchema.safeParse(parsed);
       if (!result.success) {
         throw new Error(
-          `LLM returned invalid JSON for ${spanName}: ${result.error.message}`,
+          `LLM returned invalid invoice JSON: ${result.error.message}`,
         );
       }
 
@@ -215,147 +222,4 @@ const callLlmJson = async <T>(
       };
     },
   );
-};
-
-/** Step 1 — payable-invoice triage (always). */
-const classifyEmailWithLlm = (input: EmailInput) =>
-  callLlmJson(
-    "classifyEmailWithLlm",
-    `You triage email for accounts payable. Return JSON only.
-isInvoice=true only for unpaid/payable invoices or bills with an amount owed.
-isInvoice=false for receipts, marketing, personal mail, shipping notices, etc.
-Keep summary to one short sentence. confidence is 0.0–1.0.`,
-    `Classify this email.
-
-Return ONLY JSON:
-{"isInvoice":boolean,"summary":string|null,"confidence":number}
-
-${emailBlock(input)}`,
-    ClassifySchema,
-  );
-
-/** Step 2a — field extraction when classify says invoice. */
-const extractInvoiceFieldsWithLlm = (input: EmailInput) =>
-  callLlmJson(
-    "extractInvoiceFieldsWithLlm",
-    `Extract payable-invoice fields. Return JSON only.
-amount = total due (number). currency = ISO code. dueDate = YYYY-MM-DD or null.
-confidence is 0.0–1.0 for the extraction.`,
-    `Extract invoice fields from this email (already classified as a payable invoice).
-
-Return ONLY JSON:
-{"vendor":string|null,"amount":number|null,"currency":string|null,"dueDate":"YYYY-MM-DD"|null,"invoiceNumber":string|null,"summary":string|null,"confidence":number}
-
-${emailBlock(input)}`,
-    ExtractSchema,
-  );
-
-/** Step 2b — rejection rationale when classify says non-invoice (keeps a 2nd llm_call). */
-const explainRejectionWithLlm = (input: EmailInput, classifySummary: string | null) =>
-  callLlmJson(
-    "explainRejectionWithLlm",
-    `Explain why this email is not a payable invoice. Return JSON only.
-All invoice fields must be null. rationale = short rejection reason. confidence 0.0–1.0.`,
-    `This email was classified as NOT a payable invoice (triage summary: ${classifySummary || "n/a"}).
-Confirm rejection and explain briefly.
-
-Return ONLY JSON:
-{"vendor":null,"amount":null,"currency":null,"dueDate":null,"invoiceNumber":null,"summary":string|null,"confidence":number,"rationale":string}
-
-${emailBlock(input)}`,
-    RejectSchema,
-  );
-
-/** Step 3 — brief AP note / next action (always). */
-const finalizeApNoteWithLlm = (
-  input: EmailInput,
-  draft: {
-    isInvoice: boolean;
-    vendor: string | null;
-    amount: number | null;
-    currency: string | null;
-    dueDate: string | null;
-    summary: string | null;
-    rationale?: string;
-  },
-) =>
-  callLlmJson(
-    "finalizeApNoteWithLlm",
-    `Write a 1–2 sentence AP clerk note. Return JSON only: {"apNote":string}.
-Be concise. No markdown.`,
-    `Draft a short AP note / next action for this email.
-
-Context:
-- isInvoice: ${draft.isInvoice}
-- vendor: ${draft.vendor}
-- amount: ${draft.amount} ${draft.currency || ""}
-- dueDate: ${draft.dueDate}
-- summary: ${draft.summary}
-- rejection: ${draft.rationale || "n/a"}
-
-Subject: ${input.subject}
-From: ${input.from}
-
-Return ONLY JSON: {"apNote":string}`,
-    FinalizeSchema,
-  );
-
-/**
- * Fixed 3-step LLM pipeline under the caller's entry_point context:
- * classify → extract | explainRejection → finalize.
- * Every email produces 3 nested llm_call spans (for Overmind multi-call scoring).
- */
-export const analyzeEmailWithLlm = async (
-  input: EmailInput,
-): Promise<LlmExtraction> => {
-  const classified = await classifyEmailWithLlm(input);
-
-  let vendor: string | null = null;
-  let amount: number | null = null;
-  let currency: string | null = null;
-  let dueDate: string | null = null;
-  let invoiceNumber: string | null = null;
-  let summary = classified.summary;
-  let confidence = classified.confidence;
-  let rationale: string | undefined;
-
-  if (classified.isInvoice) {
-    const extracted = await extractInvoiceFieldsWithLlm(input);
-    vendor = extracted.vendor;
-    amount = extracted.amount;
-    currency = extracted.currency;
-    dueDate = extracted.dueDate;
-    invoiceNumber = extracted.invoiceNumber;
-    summary = extracted.summary ?? classified.summary;
-    confidence = extracted.confidence;
-  } else {
-    const rejected = await explainRejectionWithLlm(input, classified.summary);
-    summary = rejected.summary ?? classified.summary;
-    confidence = rejected.confidence;
-    rationale = rejected.rationale;
-  }
-
-  const finalized = await finalizeApNoteWithLlm(input, {
-    isInvoice: classified.isInvoice,
-    vendor,
-    amount,
-    currency,
-    dueDate,
-    summary,
-    rationale,
-  });
-
-  // Prefer finalize note in summary when present; keeps harness shape unchanged.
-  const assembled = {
-    isInvoice: classified.isInvoice,
-    vendor,
-    amount,
-    currency,
-    dueDate,
-    invoiceNumber,
-    summary: finalized.apNote || summary,
-    confidence,
-  };
-
-  return LlmExtractionSchema.parse(assembled);
 };

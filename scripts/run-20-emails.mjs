@@ -60,7 +60,7 @@ console.log(
 );
 console.log(
   isTelemetryEnabled()
-    ? "Overmind telemetry: ON (one entry_point + 3 llm_calls per email)\n"
+    ? "Overmind telemetry: ON (one entry_point + llm_call trace per email)\n"
     : "Overmind telemetry: OFF (set OVERMIND_API_KEY to export traces)\n",
 );
 

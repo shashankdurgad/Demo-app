@@ -3,122 +3,80 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY = "test-key";
 process.env.OPENAI_MODEL = "gpt-4o-mini";
 
-/**
- * Each email runs a fixed 3-step LLM pipeline (classify → extract|reject → finalize).
- * Mock returns one response per fetch in that order.
- */
-const pipelineByEmail = new Map([
+const responses = new Map([
   [
     "demo-1",
-    [
-      { isInvoice: true, summary: "Northwind payable invoice", confidence: 0.92 },
-      {
-        vendor: "Northwind",
-        amount: 1240.5,
-        currency: "GBP",
-        dueDate: "2026-07-31",
-        invoiceNumber: "INV-1042",
-        summary: "Northwind invoice INV-1042",
-        confidence: 0.92,
-      },
-      { apNote: "Pay Northwind INV-1042 £1240.50 by 2026-07-31." },
-    ],
+    {
+      isInvoice: true,
+      vendor: "Northwind",
+      amount: 1240.5,
+      currency: "GBP",
+      dueDate: "2026-07-31",
+      invoiceNumber: "INV-1042",
+      summary: "Northwind invoice INV-1042",
+      confidence: 0.92,
+    },
   ],
   [
     "demo-2",
-    [
-      { isInvoice: true, summary: "AWS payable invoice", confidence: 0.9 },
-      {
-        vendor: "Amazon",
-        amount: 312.88,
-        currency: "USD",
-        dueDate: "2026-07-20",
-        invoiceNumber: "123456789",
-        summary: "AWS invoice",
-        confidence: 0.9,
-      },
-      { apNote: "Schedule AWS invoice 123456789 for $312.88." },
-    ],
+    {
+      isInvoice: true,
+      vendor: "Amazon",
+      amount: 312.88,
+      currency: "USD",
+      dueDate: "2026-07-20",
+      invoiceNumber: "123456789",
+      summary: "AWS invoice",
+      confidence: 0.9,
+    },
   ],
   [
     "demo-3",
-    [
-      { isInvoice: false, summary: "Personal lunch email", confidence: 0.95 },
-      {
-        vendor: null,
-        amount: null,
-        currency: null,
-        dueDate: null,
-        invoiceNumber: null,
-        summary: "Personal lunch email",
-        confidence: 0.95,
-        rationale: "Personal chat, not a payable invoice.",
-      },
-      { apNote: "No AP action — personal lunch thread." },
-    ],
+    {
+      isInvoice: false,
+      vendor: null,
+      amount: null,
+      currency: null,
+      dueDate: null,
+      invoiceNumber: null,
+      summary: "Personal lunch email",
+      confidence: 0.95,
+    },
   ],
   [
     "demo-4",
-    [
-      { isInvoice: false, summary: "Paid Figma receipt", confidence: 0.93 },
-      {
-        vendor: null,
-        amount: null,
-        currency: null,
-        dueDate: null,
-        invoiceNumber: null,
-        summary: "Paid receipt",
-        confidence: 0.93,
-        rationale: "Already-paid receipt, not payable.",
-      },
-      { apNote: "Ignore — Figma receipt already paid." },
-    ],
+    {
+      isInvoice: false,
+      vendor: "Figma",
+      amount: 45,
+      currency: "USD",
+      dueDate: null,
+      invoiceNumber: null,
+      summary: "Paid receipt",
+      confidence: 0.93,
+    },
   ],
   [
     "demo-5",
-    [
-      { isInvoice: true, summary: "Cloudhost payable invoice", confidence: 0.91 },
-      {
-        vendor: "Cloudhost",
-        amount: 890,
-        currency: "EUR",
-        dueDate: "2026-07-16",
-        invoiceNumber: "7781",
-        summary: "Cloudhost invoice 7781",
-        confidence: 0.91,
-      },
-      { apNote: "Pay Cloudhost 7781 €890 by 2026-07-16." },
-    ],
+    {
+      isInvoice: true,
+      vendor: "Cloudhost",
+      amount: 890,
+      currency: "EUR",
+      dueDate: "2026-07-16",
+      invoiceNumber: "7781",
+      summary: "Cloudhost invoice 7781",
+      confidence: 0.91,
+    },
   ],
 ]);
 
-const defaultNonInvoicePipeline = [
-  { isInvoice: false, summary: "Not a payable invoice", confidence: 0.9 },
-  {
-    vendor: null,
-    amount: null,
-    currency: null,
-    dueDate: null,
-    invoiceNumber: null,
-    summary: "Not a payable invoice",
-    confidence: 0.9,
-    rationale: "Does not look like a payable invoice.",
-  },
-  { apNote: "No AP action required." },
-];
-
-const { DEMO_EMAILS } = await import("../src/lib/demo-emails.ts");
-
-/** Flat queue: 3 mock responses per demo email, in corpus order. */
-const responseQueue = DEMO_EMAILS.flatMap((email) => {
-  const pipeline = pipelineByEmail.get(email.id) || defaultNonInvoicePipeline;
-  return [...pipeline];
-});
-
 let callIndex = 0;
+const demoOrder = ["demo-1", "demo-2", "demo-3", "demo-4", "demo-5"];
 
 globalThis.fetch = async () => {
-  const payload = responseQueue[callIndex++] || defaultNonInvoicePipeline[0];
+  const id = demoOrder[callIndex++] || "demo-3";
+  const payload = responses.get(id);
   return {
     ok: true,
     status: 200,
@@ -130,6 +88,7 @@ globalThis.fetch = async () => {
 };
 
 const { runInvoiceAgent } = await import("../src/lib/agent/triage.ts");
+const { DEMO_EMAILS } = await import("../src/lib/demo-emails.ts");
 const { isLlmConfigured, requireLlmConfigured } = await import(
   "../src/lib/agent/llm.ts"
 );
@@ -149,8 +108,6 @@ assert.equal(
   invoices.find((invoice) => invoice.vendor === "Northwind")?.amount?.value,
   1240.5,
 );
-// 20 emails × 3 LLM steps
-assert.equal(callIndex, DEMO_EMAILS.length * 3);
 
 console.log(
   "LLM agent verification passed:",
@@ -160,4 +117,3 @@ console.log(
     dueDate: invoice.dueDate,
   })),
 );
-console.log(`Mock LLM calls: ${callIndex} (3 per email × ${DEMO_EMAILS.length})`);
