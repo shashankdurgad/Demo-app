@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { initTracing, withSpan } from "@/lib/tracing";
 
 const LlmExtractionSchema = z.object({
   isInvoice: z.boolean(),
@@ -113,7 +114,42 @@ const extractJsonObject = (content: string) => {
   return JSON.parse(match[0]) as unknown;
 };
 
+const toGenAiMessages = (messages: Array<{ role: string; content: string }>) =>
+  JSON.stringify(
+    messages.map((message) => ({
+      role: message.role,
+      parts: [{ type: "text", content: message.content }],
+    })),
+  );
+
 export const analyzeEmailWithLlm = async (input: {
+  subject: string;
+  from: string;
+  date: string;
+  text: string;
+}): Promise<LlmExtraction> => {
+  initTracing();
+  return withSpan(
+    "Ledgerline Invoice Triage Agent",
+    async (entrySpan) => {
+      entrySpan.setAttribute("overmind.span.type", "entry_point");
+      entrySpan.setAttribute(
+        "overmind.input.data",
+        JSON.stringify({
+          subject: input.subject,
+          from: input.from,
+          date: input.date,
+          textLength: input.text.length,
+        }),
+      );
+      const result = await analyzeEmailWithLlmImpl(input);
+      entrySpan.setAttribute("overmind.output.data", JSON.stringify(result));
+      return result;
+    },
+  );
+};
+
+const analyzeEmailWithLlmImpl = async (input: {
   subject: string;
   from: string;
   date: string;
@@ -152,34 +188,70 @@ ${input.text.slice(0, 10000)}`;
     { role: "user", content: userPrompt },
   ];
 
-  const response = await fetch(endpoint.url, {
-    method: "POST",
-    headers: endpoint.headers,
-    body: JSON.stringify({
-      model: endpoint.model,
-      temperature,
-      messages,
-      response_format: { type: "json_object" },
-    }),
-  });
+  const rawContent = await withSpan(
+    "chat.completions",
+    async (llmSpan) => {
+      llmSpan.setAttribute("overmind.span.type", "llm_call");
+      llmSpan.setAttribute("gen_ai.request.model", endpoint.model);
+      llmSpan.setAttribute("gen_ai.request.temperature", temperature);
+      llmSpan.setAttribute("gen_ai.request.response_format", "json_object");
+      llmSpan.setAttribute("gen_ai.request.max_input_chars", 10000);
+      llmSpan.setAttribute("gen_ai.input.messages", toGenAiMessages(messages));
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
-    );
-  }
+      const response = await fetch(endpoint.url, {
+        method: "POST",
+        headers: endpoint.headers,
+        body: JSON.stringify({
+          model: endpoint.model,
+          temperature,
+          messages,
+          response_format: { type: "json_object" },
+        }),
+      });
 
-  const data = (await response.json()) as {
-    choices?: Array<{
-      message?: { content?: string };
-    }>;
-  };
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(
+          `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
+        );
+      }
 
-  const rawContent = data.choices?.[0]?.message?.content;
-  if (!rawContent) {
-    throw new Error("LLM returned an empty response.");
-  }
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: { content?: string };
+        }>;
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+        };
+      };
+
+      if (data.usage?.prompt_tokens != null) {
+        llmSpan.setAttribute(
+          "gen_ai.usage.input_tokens",
+          data.usage.prompt_tokens,
+        );
+      }
+      if (data.usage?.completion_tokens != null) {
+        llmSpan.setAttribute(
+          "gen_ai.usage.output_tokens",
+          data.usage.completion_tokens,
+        );
+      }
+
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error("LLM returned an empty response.");
+      }
+
+      llmSpan.setAttribute(
+        "gen_ai.output.messages",
+        toGenAiMessages([{ role: "assistant", content }]),
+      );
+      return content;
+    },
+  );
 
   const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
 
