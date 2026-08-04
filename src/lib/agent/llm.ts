@@ -1,4 +1,6 @@
+import { context, trace, SpanStatusCode } from "@opentelemetry/api";
 import { z } from "zod";
+import { ensureTracingInit, tracer } from "@/lib/tracing";
 
 const LlmExtractionSchema = z.object({
   isInvoice: z.boolean(),
@@ -113,12 +115,25 @@ const extractJsonObject = (content: string) => {
   return JSON.parse(match[0]) as unknown;
 };
 
+const toGenAiMessages = (messages: Array<{ role: string; content: string }>) =>
+  JSON.stringify(
+    messages.map((message) => ({
+      role: message.role,
+      parts: [{ type: "text", content: message.content }],
+    })),
+  );
+
 export const analyzeEmailWithLlm = async (input: {
   subject: string;
   from: string;
   date: string;
   text: string;
 }): Promise<LlmExtraction> => {
+  ensureTracingInit();
+  const entrySpan = tracer.startSpan("Ledgerline Invoice Triage Agent");
+  entrySpan.setAttribute("overmind.input.data", JSON.stringify(input));
+
+  try {
   const endpoint = getLlmEndpoint();
   const temperature = 0;
 
@@ -152,16 +167,36 @@ ${input.text.slice(0, 10000)}`;
     { role: "user", content: userPrompt },
   ];
 
-  const response = await fetch(endpoint.url, {
-    method: "POST",
-    headers: endpoint.headers,
-    body: JSON.stringify({
-      model: endpoint.model,
-      temperature,
-      messages,
-      response_format: { type: "json_object" },
-    }),
-  });
+  const llmSpan = tracer.startSpan(
+    "llm_call",
+    undefined,
+    trace.setSpan(context.active(), entrySpan),
+  );
+  llmSpan.setAttribute(
+    "gen_ai.system",
+    endpoint.provider === "openai" ? "openai" : "ollama",
+  );
+  llmSpan.setAttribute("gen_ai.request.model", endpoint.model);
+  llmSpan.setAttribute("gen_ai.request.temperature", temperature);
+  llmSpan.setAttribute("gen_ai.request.response_format", "json_object");
+  llmSpan.setAttribute("gen_ai.input.messages", toGenAiMessages(messages));
+
+  let rawContent: string;
+  try {
+  const response = await context.with(
+    trace.setSpan(context.active(), llmSpan),
+    async () =>
+      fetch(endpoint.url, {
+        method: "POST",
+        headers: endpoint.headers,
+        body: JSON.stringify({
+          model: endpoint.model,
+          temperature,
+          messages,
+          response_format: { type: "json_object" },
+        }),
+      }),
+  );
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");
@@ -174,11 +209,49 @@ ${input.text.slice(0, 10000)}`;
     choices?: Array<{
       message?: { content?: string };
     }>;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+    };
   };
 
-  const rawContent = data.choices?.[0]?.message?.content;
+  if (data.usage?.prompt_tokens != null) {
+    llmSpan.setAttribute(
+      "gen_ai.usage.prompt_tokens",
+      data.usage.prompt_tokens,
+    );
+  }
+  if (data.usage?.completion_tokens != null) {
+    llmSpan.setAttribute(
+      "gen_ai.usage.completion_tokens",
+      data.usage.completion_tokens,
+    );
+  }
+
+  rawContent = data.choices?.[0]?.message?.content ?? "";
   if (!rawContent) {
     throw new Error("LLM returned an empty response.");
+  }
+
+  llmSpan.setAttribute(
+    "gen_ai.output.messages",
+    JSON.stringify([
+      {
+        role: "assistant",
+        parts: [{ type: "text", content: rawContent }],
+      },
+    ]),
+  );
+  } catch (err) {
+    llmSpan.recordException(err as Error);
+    llmSpan.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  } finally {
+    llmSpan.end();
   }
 
   const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
@@ -195,5 +268,16 @@ ${input.text.slice(0, 10000)}`;
     );
   }
 
+  entrySpan.setAttribute("overmind.output.data", JSON.stringify(result.data));
   return result.data;
+  } catch (err) {
+    entrySpan.recordException(err as Error);
+    entrySpan.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  } finally {
+    entrySpan.end();
+  }
 };

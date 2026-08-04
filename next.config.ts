@@ -5,6 +5,8 @@ const nextConfig: NextConfig = {
     "pdf-parse",
     "googleapis",
     "google-auth-library",
+    "@opentelemetry/sdk-trace-node",
+    "@opentelemetry/exporter-trace-otlp-proto",
   ],
 };
 
