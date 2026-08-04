@@ -1,4 +1,6 @@
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { z } from "zod";
+import { ensureOvermindTracing } from "@/lib/overmind";
 
 const LlmExtractionSchema = z.object({
   isInvoice: z.boolean(),
@@ -113,7 +115,7 @@ const extractJsonObject = (content: string) => {
   return JSON.parse(match[0]) as unknown;
 };
 
-export const analyzeEmailWithLlm = async (input: {
+const fetchLlmExtractionImpl = async (input: {
   subject: string;
   from: string;
   date: string;
@@ -174,7 +176,36 @@ ${input.text.slice(0, 10000)}`;
     choices?: Array<{
       message?: { content?: string };
     }>;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+    };
   };
+
+  const activeSpan = trace.getActiveSpan();
+  if (activeSpan) {
+    activeSpan.setAttribute("gen_ai.request.model", endpoint.model);
+    activeSpan.setAttribute("prompt", JSON.stringify(messages));
+    if (data.usage?.prompt_tokens != null) {
+      activeSpan.setAttribute(
+        "gen_ai.usage.input_tokens",
+        data.usage.prompt_tokens,
+      );
+    }
+    if (data.usage?.completion_tokens != null) {
+      activeSpan.setAttribute(
+        "gen_ai.usage.output_tokens",
+        data.usage.completion_tokens,
+      );
+    }
+    if (data.usage?.total_tokens != null) {
+      activeSpan.setAttribute(
+        "gen_ai.usage.total_tokens",
+        data.usage.total_tokens,
+      );
+    }
+  }
 
   const rawContent = data.choices?.[0]?.message?.content;
   if (!rawContent) {
@@ -196,4 +227,79 @@ ${input.text.slice(0, 10000)}`;
   }
 
   return result.data;
+};
+
+const fetchLlmExtraction = async (input: {
+  subject: string;
+  from: string;
+  date: string;
+  text: string;
+}): Promise<LlmExtraction> => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("Raw LLM HTTP fetch", async (span) => {
+    span.setAttribute("overmind.span.type", "function");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify(input));
+    try {
+      const result = await fetchLlmExtractionImpl(input);
+      span.setAttribute("outputs", JSON.stringify(result));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
+};
+
+const analyzeEmailWithLlmImpl = async (input: {
+  subject: string;
+  from: string;
+  date: string;
+  text: string;
+}): Promise<LlmExtraction> => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("Internal LLM fetch implementation", async (span) => {
+    span.setAttribute("overmind.span.type", "function");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify(input));
+    try {
+      const result = await fetchLlmExtraction(input);
+      span.setAttribute("outputs", JSON.stringify(result));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
+};
+
+export const analyzeEmailWithLlm = async (input: {
+  subject: string;
+  from: string;
+  date: string;
+  text: string;
+}): Promise<LlmExtraction> => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("Ledgerline Invoice Triage Agent", async (span) => {
+    span.setAttribute("overmind.span.type", "entry_point");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify(input));
+    try {
+      const result = await analyzeEmailWithLlmImpl(input);
+      span.setAttribute("outputs", JSON.stringify(result));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
 };

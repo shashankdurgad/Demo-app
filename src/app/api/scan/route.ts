@@ -1,14 +1,16 @@
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { NextRequest, NextResponse } from "next/server";
 import { isLlmConfigured } from "@/lib/agent/llm";
 import { runInvoiceAgent } from "@/lib/agent/triage";
 import { DEMO_EMAILS } from "@/lib/demo-emails";
 import { fetchCandidateEmails } from "@/lib/gmail";
+import { ensureOvermindTracing } from "@/lib/overmind";
 import { getSession } from "@/lib/session";
 import type { ScanResult } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-export const POST = async (request: NextRequest) => {
+const handleScanPost = async (request: NextRequest) => {
   if (!isLlmConfigured()) {
     return NextResponse.json(
       {
@@ -62,4 +64,24 @@ export const POST = async (request: NextRequest) => {
       err instanceof Error ? err.message : "Failed to run invoice LLM agent";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+};
+
+export const POST = async (request: NextRequest) => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("HTTP scan API entrypoint", async (span) => {
+    span.setAttribute("overmind.span.type", "entry_point");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify({ method: request.method, url: request.url }));
+    try {
+      const result = await handleScanPost(request);
+      span.setAttribute("outputs", JSON.stringify({ status: result.status }));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
 };

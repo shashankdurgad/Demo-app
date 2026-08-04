@@ -1,6 +1,8 @@
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { analyzeEmailWithLlm } from "@/lib/agent/llm";
 import { generateDemoEmails } from "@/lib/generate-demo-emails";
 import type { RawEmail } from "@/lib/gmail";
+import { ensureOvermindTracing } from "@/lib/overmind";
 import type { InvoiceRecord } from "@/lib/types";
 
 /**
@@ -337,7 +339,7 @@ const toGmailUrl = (_emailId: string) => `#`;
  * Apply themes failure hooks: corruptions happen in post-processing after a
  * real LLM call; simulated errors throw and are caught as failed outcomes.
  */
-export const analyzeThemesEmail = async (
+const analyzeThemesEmailImpl = async (
   item: ThemesCorpusItem,
 ): Promise<ThemesAnalyzeResult> => {
   try {
@@ -440,6 +442,28 @@ export const analyzeThemesEmail = async (
       record: null,
     };
   }
+};
+
+export const analyzeThemesEmail = async (
+  item: ThemesCorpusItem,
+): Promise<ThemesAnalyzeResult> => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("Themes corpus harness entrypoint", async (span) => {
+    span.setAttribute("overmind.span.type", "entry_point");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify({ emailId: item.email.id, mode: item.mode }));
+    try {
+      const result = await analyzeThemesEmailImpl(item);
+      span.setAttribute("outputs", JSON.stringify(result));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
 };
 
 export const tallyModes = (items: ThemesCorpusItem[]) => {

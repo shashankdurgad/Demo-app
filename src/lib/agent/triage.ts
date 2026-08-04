@@ -1,5 +1,7 @@
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 import type { RawEmail } from "@/lib/gmail";
 import { analyzeEmailWithLlm, requireLlmConfigured } from "@/lib/agent/llm";
+import { ensureOvermindTracing } from "@/lib/overmind";
 import type { InvoiceRecord } from "@/lib/types";
 
 const toGmailUrl = (emailId: string, source: "gmail" | "demo") =>
@@ -7,7 +9,7 @@ const toGmailUrl = (emailId: string, source: "gmail" | "demo") =>
     ? "#"
     : `https://mail.google.com/mail/u/0/#inbox/${emailId}`;
 
-export const analyzeEmail = async (
+const analyzeEmailImpl = async (
   email: RawEmail,
   source: "gmail" | "demo",
 ): Promise<InvoiceRecord | null> => {
@@ -54,7 +56,30 @@ export const analyzeEmail = async (
   };
 };
 
-export const runInvoiceAgent = async (
+export const analyzeEmail = async (
+  email: RawEmail,
+  source: "gmail" | "demo",
+): Promise<InvoiceRecord | null> => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("Per-email triage entrypoint", async (span) => {
+    span.setAttribute("overmind.span.type", "entry_point");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify({ email, source }));
+    try {
+      const result = await analyzeEmailImpl(email, source);
+      span.setAttribute("outputs", JSON.stringify(result));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
+};
+
+const runInvoiceAgentImpl = async (
   emails: RawEmail[],
   source: "gmail" | "demo",
 ) => {
@@ -74,4 +99,27 @@ export const runInvoiceAgent = async (
   });
 
   return invoices;
+};
+
+export const runInvoiceAgent = async (
+  emails: RawEmail[],
+  source: "gmail" | "demo",
+) => {
+  ensureOvermindTracing();
+  const tracer = trace.getTracer("ledgerline-invoice-triage");
+  return tracer.startActiveSpan("Batch invoice agent orchestrator", async (span) => {
+    span.setAttribute("overmind.span.type", "entry_point");
+    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
+    span.setAttribute("inputs", JSON.stringify({ emailCount: emails.length, source }));
+    try {
+      const result = await runInvoiceAgentImpl(emails, source);
+      span.setAttribute("outputs", JSON.stringify({ invoiceCount: result.length }));
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    }
+  });
 };
