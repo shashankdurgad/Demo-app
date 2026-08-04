@@ -1,13 +1,11 @@
-import { trace } from "@opentelemetry/api";
 import { analyzeEmailWithLlm } from "@/lib/agent/llm";
 import { generateDemoEmails } from "@/lib/generate-demo-emails";
 import type { RawEmail } from "@/lib/gmail";
-import { withEntryPointSpan, withLlmCallSpan } from "@/lib/telemetry";
 import type { InvoiceRecord } from "@/lib/types";
 
 /**
  * Intended failure / shape tags for the themes corpus.
- * Stored only in a local id→mode map (never stamped on OTEL spans).
+ * Stored only in a local id→mode map.
  */
 export type ThemeFailureMode =
   | "ok"
@@ -28,7 +26,6 @@ export type ThemesCorpusItem = {
 export type ThemesAnalyzeResult = {
   emailId: string;
   mode: ThemeFailureMode;
-  traceId: string | null;
   ok: boolean;
   isInvoice: boolean;
   error: string | null;
@@ -337,97 +334,70 @@ export const generateThemesCorpus = (
 const toGmailUrl = (_emailId: string) => `#`;
 
 /**
- * One email → one root entry_point. Applies themes failure hooks WITHOUT
- * writing false telemetry: corruptions happen in post-processing after a
- * real llm_call; errors throw so OTEL records real ERROR status.
+ * Apply themes failure hooks: corruptions happen in post-processing after a
+ * real LLM call; simulated errors throw and are caught as failed outcomes.
  */
 export const analyzeThemesEmail = async (
   item: ThemesCorpusItem,
 ): Promise<ThemesAnalyzeResult> => {
-  let traceId: string | null = null;
-
   try {
-    const record = await withEntryPointSpan(
-      "analyzeEmail",
-      { email: item.email, source: "demo" },
-      async () => {
-        traceId = trace.getActiveSpan()?.spanContext().traceId ?? null;
+    if (item.mode === "llm_call_error") {
+      throw new Error(
+        "Simulated provider failure before output (themes corpus llm_call_error)",
+      );
+    }
 
-        if (item.mode === "llm_call_error") {
-          // Provider failure before any assistant output — llm_call errors, no answer.
-          await withLlmCallSpan(
-            {
-              name: "analyzeEmailWithLlm",
-              model: process.env.OPENAI_MODEL || process.env.OLLAMA_MODEL || "gpt-4o-mini",
-              provider: process.env.OPENAI_API_KEY ? "openai" : "ollama",
-              messages: [
-                { role: "system", content: "themes corpus" },
-                { role: "user", content: item.email.subject },
-              ],
-              temperature: 0,
-            },
-            async () => {
-              throw new Error(
-                "Simulated provider failure before output (themes corpus llm_call_error)",
-              );
-            },
-          );
-          return null;
-        }
+    const combinedText = [
+      item.email.subject,
+      item.email.snippet,
+      item.email.bodyText,
+      ...item.email.attachmentTexts,
+    ]
+      .filter(Boolean)
+      .join("\n");
 
-        const combinedText = [
-          item.email.subject,
-          item.email.snippet,
-          item.email.bodyText,
-          ...item.email.attachmentTexts,
-        ]
-          .filter(Boolean)
-          .join("\n");
+    const llm = await analyzeEmailWithLlm({
+      subject: item.email.subject,
+      from: item.email.from,
+      date: item.email.date,
+      text: combinedText,
+    });
 
-        const llm = await analyzeEmailWithLlm({
-          subject: item.email.subject,
-          from: item.email.from,
-          date: item.email.date,
-          text: combinedText,
-        });
+    let isInvoice = llm.isInvoice;
+    let amount = llm.amount;
+    let currency = llm.currency;
+    let dueDate = llm.dueDate;
+    let vendor = llm.vendor;
 
-        // Honest post-processing corruptions (after llm_call recorded its output).
-        let isInvoice = llm.isInvoice;
-        let amount = llm.amount;
-        let currency = llm.currency;
-        let dueDate = llm.dueDate;
-        let vendor = llm.vendor;
+    if (item.mode === "missing_amount") {
+      amount = null;
+    }
+    if (item.mode === "missing_due_date") {
+      dueDate = null;
+    }
+    if (item.mode === "currency_confusion") {
+      currency = "USD";
+    }
+    if (item.mode === "false_positive") {
+      // Force payable classification in harness output when model declined.
+      isInvoice = true;
+      vendor = vendor || "Growth Lab";
+      amount = amount ?? 49;
+      currency = currency || "USD";
+    }
+    if (item.mode === "false_negative") {
+      isInvoice = false;
+    }
 
-        if (item.mode === "missing_amount") {
-          amount = null;
-        }
-        if (item.mode === "missing_due_date") {
-          dueDate = null;
-        }
-        if (item.mode === "currency_confusion") {
-          currency = "USD";
-        }
-        if (item.mode === "false_positive") {
-          // Force payable classification in harness output when model declined.
-          isInvoice = true;
-          vendor = vendor || "Growth Lab";
-          amount = amount ?? 49;
-          currency = currency || "USD";
-        }
-        if (item.mode === "false_negative") {
-          isInvoice = false;
-        }
+    if (item.mode === "post_llm_error") {
+      throw new Error(
+        "Due-date normalisation failed (themes corpus post_llm_error)",
+      );
+    }
 
-        if (item.mode === "post_llm_error") {
-          // llm_call already succeeded with outputs; fail the entry_point after.
-          throw new Error(
-            "Due-date normalisation failed (themes corpus post_llm_error)",
-          );
-        }
-
-        if (!isInvoice) return null;
-
-        return {
+    const record: InvoiceRecord | null = !isInvoice
+      ? null
+      : {
           id: `demo-${item.email.id}`,
           emailId: item.email.id,
           threadId: item.email.threadId || undefined,
@@ -450,13 +420,10 @@ export const analyzeThemesEmail = async (
           gmailUrl: toGmailUrl(item.email.id),
           source: "demo" as const,
         };
-      },
-    );
 
     return {
       emailId: item.email.id,
       mode: item.mode,
-      traceId,
       ok: true,
       isInvoice: Boolean(record),
       error: null,
@@ -467,7 +434,6 @@ export const analyzeThemesEmail = async (
     return {
       emailId: item.email.id,
       mode: item.mode,
-      traceId,
       ok: false,
       isInvoice: false,
       error: message,

@@ -41,15 +41,6 @@ if (!process.env.OPENAI_API_KEY && !process.env.OLLAMA_BASE_URL) {
 const { DEMO_EMAILS } = await import("../src/lib/demo-emails.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
-const {
-  forceFlushTraces,
-  initTelemetry,
-  isNestEntryPointsEnabled,
-  isTelemetryEnabled,
-  withBatchSpan,
-} = await import("../src/lib/telemetry.ts");
-
-initTelemetry();
 
 if (DEMO_EMAILS.length !== 20) {
   console.error(
@@ -59,63 +50,32 @@ if (DEMO_EMAILS.length !== 20) {
 }
 
 const status = getLlmStatus();
-const nest = isNestEntryPointsEnabled();
 console.log(
-  `Running ${DEMO_EMAILS.length} emails through analyzeEmail (${status.provider}/${status.model})…`,
+  `Running ${DEMO_EMAILS.length} emails through analyzeEmail (${status.provider}/${status.model})…\n`,
 );
-if (!isTelemetryEnabled()) {
-  console.log(
-    "Overmind telemetry: OFF (set OVERMIND_API_KEY to export traces)\n",
-  );
-} else if (nest) {
-  console.log(
-    `Overmind: NESTED mode — one batch root + ${DEMO_EMAILS.length} analyzeEmail entry_points`,
-  );
-  console.log(
-    "(requires OVERMIND_NEST_ENTRY_POINTS=1 and OVERMIND_API_KEY)\n",
-  );
-} else {
-  console.log(
-    "Overmind telemetry: ON (one entry_point + llm_call trace per email)",
-  );
-  console.log(
-    "(set OVERMIND_NEST_ENTRY_POINTS=1 for one batch root + N entry_points)\n",
-  );
-}
 
 const rows = [];
 
-const runLoop = async () => {
-  for (const email of DEMO_EMAILS) {
-    let record;
-    try {
-      record = await analyzeEmail(email, "demo");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`Hard failure on ${email.id}: ${message}`);
-      await forceFlushTraces();
-      process.exit(1);
-    }
-
-    const row = {
-      emailId: email.id,
-      subject: email.subject,
-      isInvoice: Boolean(record),
-      harnessOutput: record,
-    };
-    rows.push(row);
-    console.log(JSON.stringify(row, null, 2));
-    console.log("---");
+for (const email of DEMO_EMAILS) {
+  let record;
+  try {
+    record = await analyzeEmail(email, "demo");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Hard failure on ${email.id}: ${message}`);
+    process.exit(1);
   }
-  return rows;
-};
 
-// Batch parent is the sole structural root when nest flag is on; no-op otherwise.
-await withBatchSpan(
-  "batchScan",
-  { source: "demo", emailCount: DEMO_EMAILS.length },
-  runLoop,
-);
+  const row = {
+    emailId: email.id,
+    subject: email.subject,
+    isInvoice: Boolean(record),
+    harnessOutput: record,
+  };
+  rows.push(row);
+  console.log(JSON.stringify(row, null, 2));
+  console.log("---");
+}
 
 const invoiceRows = rows.filter((row) => row.isInvoice);
 console.log("\nSummary");
@@ -125,5 +85,4 @@ console.log(
   `  Rejected / non-invoices: ${DEMO_EMAILS.length - invoiceRows.length}`,
 );
 
-await forceFlushTraces();
 process.exit(0);

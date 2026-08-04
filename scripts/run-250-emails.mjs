@@ -42,10 +42,6 @@ const count = Number(process.env.DEMO_EMAIL_COUNT || 250);
 const { generateDemoEmails } = await import("../src/lib/generate-demo-emails.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
-const { flushTraces, forceFlushTraces, initTelemetry, isTelemetryEnabled } =
-  await import("../src/lib/telemetry.ts");
-
-initTelemetry();
 
 const emails = generateDemoEmails(count);
 if (emails.length !== count) {
@@ -57,12 +53,7 @@ if (emails.length !== count) {
 
 const status = getLlmStatus();
 console.log(
-  `Running ${emails.length} generated emails through analyzeEmail (${status.provider}/${status.model})…`,
-);
-console.log(
-  isTelemetryEnabled()
-    ? "Overmind telemetry: ON (one entry_point + llm_call trace per email)\n"
-    : "Overmind telemetry: OFF (set OVERMIND_API_KEY to export traces)\n",
+  `Running ${emails.length} generated emails through analyzeEmail (${status.provider}/${status.model})…\n`,
 );
 
 const rows = [];
@@ -76,7 +67,6 @@ for (let i = 0; i < emails.length; i += 1) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Hard failure on ${email.id}: ${message}`);
-    await forceFlushTraces();
     process.exit(1);
   }
 
@@ -98,8 +88,6 @@ for (let i = 0; i < emails.length; i += 1) {
     console.log(
       `  [${n}/${emails.length}] invoices=${invoiceSoFar} elapsed=${elapsedSec}s last=${email.id} isInvoice=${row.isInvoice}`,
     );
-    // Periodic flush so short-lived crashes don't lose a large batch.
-    await flushTraces();
   }
 }
 
@@ -119,5 +107,4 @@ for (const row of invoiceRows.slice(0, 10)) {
   );
 }
 
-await forceFlushTraces();
 process.exit(0);

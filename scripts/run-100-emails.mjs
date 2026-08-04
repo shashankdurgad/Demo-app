@@ -42,16 +42,6 @@ const count = Number(process.env.DEMO_EMAIL_COUNT || 100);
 const { generateDemoEmails } = await import("../src/lib/generate-demo-emails.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
-const {
-  flushTraces,
-  forceFlushTraces,
-  initTelemetry,
-  isNestEntryPointsEnabled,
-  isTelemetryEnabled,
-  withBatchSpan,
-} = await import("../src/lib/telemetry.ts");
-
-initTelemetry();
 
 const emails = generateDemoEmails(count);
 if (emails.length !== count) {
@@ -62,70 +52,45 @@ if (emails.length !== count) {
 }
 
 const status = getLlmStatus();
-const nest = isNestEntryPointsEnabled();
 console.log(
-  `Running ${emails.length} generated emails through analyzeEmail (${status.provider}/${status.model})…`,
+  `Running ${emails.length} generated emails through analyzeEmail (${status.provider}/${status.model})…\n`,
 );
-if (!isTelemetryEnabled()) {
-  console.log(
-    "Overmind telemetry: OFF (set OVERMIND_API_KEY to export traces)\n",
-  );
-} else if (nest) {
-  console.log(
-    `Overmind: NESTED mode — one batch root + ${emails.length} analyzeEmail entry_points\n`,
-  );
-} else {
-  console.log(
-    "Overmind telemetry: ON (one entry_point + llm_call trace per email)\n",
-  );
-}
 
 const rows = [];
 const started = Date.now();
 
-const runLoop = async () => {
-  for (let i = 0; i < emails.length; i += 1) {
-    const email = emails[i];
-    let record;
-    try {
-      record = await analyzeEmail(email, "demo");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`Hard failure on ${email.id}: ${message}`);
-      await forceFlushTraces();
-      process.exit(1);
-    }
-
-    const row = {
-      emailId: email.id,
-      subject: email.subject,
-      isInvoice: Boolean(record),
-      confidence: record?.confidence ?? null,
-      vendor: record?.vendor ?? null,
-      amount: record?.amount?.raw ?? null,
-      dueDate: record?.dueDate ?? null,
-      summary: record?.summary ?? null,
-    };
-    rows.push(row);
-
-    const n = i + 1;
-    if (n % 10 === 0 || n === emails.length) {
-      const invoiceSoFar = rows.filter((r) => r.isInvoice).length;
-      const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
-      console.log(
-        `  [${n}/${emails.length}] invoices=${invoiceSoFar} elapsed=${elapsedSec}s last=${email.id} isInvoice=${row.isInvoice}`,
-      );
-      await flushTraces();
-    }
+for (let i = 0; i < emails.length; i += 1) {
+  const email = emails[i];
+  let record;
+  try {
+    record = await analyzeEmail(email, "demo");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Hard failure on ${email.id}: ${message}`);
+    process.exit(1);
   }
-  return rows;
-};
 
-await withBatchSpan(
-  "batchScan",
-  { source: "demo", emailCount: emails.length },
-  runLoop,
-);
+  const row = {
+    emailId: email.id,
+    subject: email.subject,
+    isInvoice: Boolean(record),
+    confidence: record?.confidence ?? null,
+    vendor: record?.vendor ?? null,
+    amount: record?.amount?.raw ?? null,
+    dueDate: record?.dueDate ?? null,
+    summary: record?.summary ?? null,
+  };
+  rows.push(row);
+
+  const n = i + 1;
+  if (n % 10 === 0 || n === emails.length) {
+    const invoiceSoFar = rows.filter((r) => r.isInvoice).length;
+    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(
+      `  [${n}/${emails.length}] invoices=${invoiceSoFar} elapsed=${elapsedSec}s last=${email.id} isInvoice=${row.isInvoice}`,
+    );
+  }
+}
 
 const invoiceRows = rows.filter((row) => row.isInvoice);
 console.log("\nSummary");
@@ -143,5 +108,4 @@ for (const row of invoiceRows.slice(0, 10)) {
   );
 }
 
-await forceFlushTraces();
 process.exit(0);

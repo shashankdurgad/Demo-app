@@ -31,9 +31,6 @@ const loadEnvLocal = () => {
 
 loadEnvLocal();
 
-// Themes corpus requires one root entry_point per email (not a nested batch root).
-delete process.env.OVERMIND_NEST_ENTRY_POINTS;
-
 if (!process.env.OPENAI_API_KEY && !process.env.OLLAMA_BASE_URL) {
   console.error(
     "Hard failure: set OPENAI_API_KEY or OLLAMA_BASE_URL in .env.local",
@@ -55,22 +52,6 @@ const {
   generateThemesCorpus,
   tallyModes,
 } = await import("../src/lib/themes-corpus.ts");
-const {
-  flushTraces,
-  forceFlushTraces,
-  initTelemetry,
-  isNestEntryPointsEnabled,
-  isTelemetryEnabled,
-} = await import("../src/lib/telemetry.ts");
-
-initTelemetry();
-
-if (isNestEntryPointsEnabled()) {
-  console.error(
-    "Hard failure: OVERMIND_NEST_ENTRY_POINTS must be unset for themes corpus (need one root per email).",
-  );
-  process.exit(1);
-}
 
 const { items, modeByEmailId } = generateThemesCorpus(count);
 if (items.length !== count) {
@@ -83,12 +64,7 @@ if (items.length !== count) {
 const planned = tallyModes(items);
 const status = getLlmStatus();
 console.log(
-  `Themes corpus: ${items.length} emails, concurrency=${concurrency} (${status.provider}/${status.model})`,
-);
-console.log(
-  isTelemetryEnabled()
-    ? "Overmind telemetry: ON — one root entry_point per email (nest flag forced off)\n"
-    : "Overmind telemetry: OFF (set OVERMIND_API_KEY to export traces)\n",
+  `Themes corpus: ${items.length} emails, concurrency=${concurrency} (${status.provider}/${status.model})\n`,
 );
 console.log("Planned mode mix:");
 for (const [mode, n] of [...planned.entries()].sort((a, b) =>
@@ -102,12 +78,6 @@ const started = Date.now();
 const results = new Array(items.length);
 let completed = 0;
 let nextIndex = 0;
-let flushLock = Promise.resolve();
-
-const scheduleFlush = () => {
-  flushLock = flushLock.then(() => flushTraces()).catch(() => {});
-  return flushLock;
-};
 
 const worker = async () => {
   while (true) {
@@ -129,25 +99,19 @@ const worker = async () => {
       console.log(
         `  [${completed}/${items.length}] failed=${failed} elapsed=${elapsedSec}s last=${item.email.id} mode=${item.mode} ok=${outcome.ok}`,
       );
-      await scheduleFlush();
     }
   }
 };
 
 await Promise.all(Array.from({ length: concurrency }, () => worker()));
-await flushLock;
 
 const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
 const byMode = new Map();
-const exampleTraceByMode = new Map();
 
 for (const row of results) {
   if (!row) continue;
   const mode = modeByEmailId.get(row.emailId) || row.mode;
   byMode.set(mode, (byMode.get(mode) || 0) + 1);
-  if (!exampleTraceByMode.has(mode) && row.traceId) {
-    exampleTraceByMode.set(mode, row.traceId);
-  }
 }
 
 const okCount = results.filter((r) => r?.ok).length;
@@ -159,14 +123,10 @@ console.log(`  Total attempted: ${results.length}`);
 console.log(`  Completed ok (no throw): ${okCount}`);
 console.log(`  Completed with error status: ${failCount}`);
 console.log(`  Elapsed: ${elapsedSec}s`);
-console.log("\nPer-mode tally (intended tags) + example trace id:");
+console.log("\nPer-mode tally (intended tags):");
 for (const mode of [...byMode.keys()].sort()) {
   const n = byMode.get(mode);
-  const tid = exampleTraceByMode.get(mode) || "(no trace id captured)";
-  console.log(`  ${mode}: ${n}  example_trace_id=${tid}`);
+  console.log(`  ${mode}: ${n}`);
 }
 
-console.log("\nForce-flushing traces…");
-await forceFlushTraces();
-console.log("Final flush succeeded.");
 process.exit(0);

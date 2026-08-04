@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { withLlmCallSpan } from "@/lib/telemetry";
 
 const LlmExtractionSchema = z.object({
   isInvoice: z.boolean(),
@@ -153,73 +152,48 @@ ${input.text.slice(0, 10000)}`;
     { role: "user", content: userPrompt },
   ];
 
-  return withLlmCallSpan(
-    {
-      name: "analyzeEmailWithLlm",
+  const response = await fetch(endpoint.url, {
+    method: "POST",
+    headers: endpoint.headers,
+    body: JSON.stringify({
       model: endpoint.model,
-      provider: endpoint.provider,
-      messages,
       temperature,
-    },
-    async () => {
-      const response = await fetch(endpoint.url, {
-        method: "POST",
-        headers: endpoint.headers,
-        body: JSON.stringify({
-          model: endpoint.model,
-          temperature,
-          messages,
-          response_format: { type: "json_object" },
-        }),
-      });
+      messages,
+      response_format: { type: "json_object" },
+    }),
+  });
 
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
-        throw new Error(
-          `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
-        );
-      }
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(
+      `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
+    );
+  }
 
-      const data = (await response.json()) as {
-        model?: string;
-        choices?: Array<{
-          finish_reason?: string;
-          message?: { content?: string };
-        }>;
-        usage?: {
-          prompt_tokens?: number;
-          completion_tokens?: number;
-          total_tokens?: number;
-        };
-      };
+  const data = (await response.json()) as {
+    choices?: Array<{
+      message?: { content?: string };
+    }>;
+  };
 
-      // Capture the TRUE raw model surface before any Zod / normalization.
-      const rawContent = data.choices?.[0]?.message?.content;
-      if (!rawContent) {
-        throw new Error("LLM returned an empty response.");
-      }
+  const rawContent = data.choices?.[0]?.message?.content;
+  if (!rawContent) {
+    throw new Error("LLM returned an empty response.");
+  }
 
-      const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
+  const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
 
-      // Some models return confidence as 0–100; normalize to 0–1 for the schema.
-      if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
-        parsed.confidence = Math.min(parsed.confidence / 100, 1);
-      }
+  // Some models return confidence as 0–100; normalize to 0–1 for the schema.
+  if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
+    parsed.confidence = Math.min(parsed.confidence / 100, 1);
+  }
 
-      const result = LlmExtractionSchema.safeParse(parsed);
-      if (!result.success) {
-        throw new Error(
-          `LLM returned invalid invoice JSON: ${result.error.message}`,
-        );
-      }
+  const result = LlmExtractionSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `LLM returned invalid invoice JSON: ${result.error.message}`,
+    );
+  }
 
-      return {
-        result: result.data,
-        rawContent,
-        usage: data.usage,
-        responseModel: data.model,
-        finishReason: data.choices?.[0]?.finish_reason,
-      };
-    },
-  );
+  return result.data;
 };

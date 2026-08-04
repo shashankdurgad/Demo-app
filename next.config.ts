@@ -5,11 +5,6 @@ const nextConfig: NextConfig = {
     "pdf-parse",
     "googleapis",
     "google-auth-library",
-    "@opentelemetry/sdk-trace-base",
-    "@opentelemetry/context-async-hooks",
-    "@opentelemetry/exporter-trace-otlp-proto",
-    "@opentelemetry/resources",
-    "@opentelemetry/semantic-conventions",
   ],
 };
 

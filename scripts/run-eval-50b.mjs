@@ -41,10 +41,6 @@ if (!process.env.OPENAI_API_KEY && !process.env.OLLAMA_BASE_URL) {
 const { EVAL_SCENARIOS_B_50 } = await import("../src/lib/eval-emails-b.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
-const { flushTraces, forceFlushTraces, initTelemetry, isTelemetryEnabled } =
-  await import("../src/lib/telemetry.ts");
-
-initTelemetry();
 
 if (EVAL_SCENARIOS_B_50.length !== 50) {
   console.error(
@@ -55,12 +51,7 @@ if (EVAL_SCENARIOS_B_50.length !== 50) {
 
 const status = getLlmStatus();
 console.log(
-  `Running ${EVAL_SCENARIOS_B_50.length} eval-B scenarios (${status.provider}/${status.model})…`,
-);
-console.log(
-  isTelemetryEnabled()
-    ? "Overmind telemetry: ON\n"
-    : "Overmind telemetry: OFF\n",
+  `Running ${EVAL_SCENARIOS_B_50.length} eval-B scenarios (${status.provider}/${status.model})…\n`,
 );
 
 const results = [];
@@ -76,7 +67,6 @@ for (let i = 0; i < EVAL_SCENARIOS_B_50.length; i += 1) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Hard failure on ${email.id}: ${message}`);
-    await forceFlushTraces();
     process.exit(1);
   }
 
@@ -99,8 +89,6 @@ for (let i = 0; i < EVAL_SCENARIOS_B_50.length; i += 1) {
   console.log(
     `[${String(i + 1).padStart(2, "0")}/50] ${mark} ${email.id} expected=${expected.isInvoice} got=${predictedIsInvoice} — ${expected.notes}`,
   );
-
-  if ((i + 1) % 10 === 0) await flushTraces();
 }
 
 const misses = results.filter((r) => !r.triageOk);
@@ -121,5 +109,4 @@ if (misses.length) {
   }
 }
 
-await forceFlushTraces();
 process.exit(0);
