@@ -1,7 +1,6 @@
-import { trace, SpanStatusCode } from "@opentelemetry/api";
 import type { RawEmail } from "@/lib/gmail";
 import { analyzeEmailWithLlm, requireLlmConfigured } from "@/lib/agent/llm";
-import { ensureOvermindTracing } from "@/lib/overmind";
+import { stampSpanInput, stampSpanOutput, withSpan } from "@/lib/overmind";
 import type { InvoiceRecord } from "@/lib/types";
 
 const toGmailUrl = (emailId: string, source: "gmail" | "demo") =>
@@ -9,77 +8,90 @@ const toGmailUrl = (emailId: string, source: "gmail" | "demo") =>
     ? "#"
     : `https://mail.google.com/mail/u/0/#inbox/${emailId}`;
 
-const analyzeEmailImpl = async (
-  email: RawEmail,
-  source: "gmail" | "demo",
-): Promise<InvoiceRecord | null> => {
-  const combinedText = [
-    email.subject,
-    email.snippet,
-    email.bodyText,
-    ...email.attachmentTexts,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const llm = await analyzeEmailWithLlm({
-    subject: email.subject,
-    from: email.from,
-    date: email.date,
-    text: combinedText,
-  });
-
-  if (!llm.isInvoice) return null;
-
-  return {
-    id: `${source}-${email.id}`,
-    emailId: email.id,
-    threadId: email.threadId || undefined,
-    subject: email.subject,
-    from: email.from,
-    vendor: llm.vendor || "Unknown vendor",
-    receivedAt: new Date(email.date).toISOString(),
-    amount:
-      llm.amount != null
-        ? {
-            value: llm.amount,
-            currency: llm.currency || "USD",
-            raw: `${llm.currency || "USD"} ${llm.amount}`,
-          }
-        : null,
-    dueDate: llm.dueDate,
-    invoiceNumber: llm.invoiceNumber,
-    confidence: Number(llm.confidence.toFixed(2)),
-    summary: llm.summary || email.snippet || email.subject,
-    gmailUrl: toGmailUrl(email.id, source),
-    source,
-  };
-};
+const toFinalOutput = (
+  llm: Awaited<ReturnType<typeof analyzeEmailWithLlm>>,
+) => ({
+  isInvoice: llm.isInvoice,
+  vendor: llm.vendor,
+  amount: llm.amount,
+  currency: llm.currency,
+  dueDate: llm.dueDate,
+  invoiceNumber: llm.invoiceNumber,
+  summary: llm.summary,
+  confidence: Number(llm.confidence.toFixed(2)),
+});
 
 export const analyzeEmail = async (
   email: RawEmail,
   source: "gmail" | "demo",
-): Promise<InvoiceRecord | null> => {
-  ensureOvermindTracing();
-  const tracer = trace.getTracer("ledgerline-invoice-triage");
-  return tracer.startActiveSpan("Per-email triage entrypoint", async (span) => {
-    span.setAttribute("overmind.span.type", "entry_point");
-    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
-    span.setAttribute("inputs", JSON.stringify({ email, source }));
-    try {
-      const result = await analyzeEmailImpl(email, source);
-      span.setAttribute("outputs", JSON.stringify(result));
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    }
-  });
-};
+): Promise<InvoiceRecord | null> =>
+  // One entry_point per email; LLM work is a child span inside analyzeEmailWithLlm.
+  withSpan(
+    "analyzeEmail",
+    "entry_point",
+    {
+      "email.id": email.id,
+      "email.subject": email.subject,
+      source,
+    },
+    async (span) => {
+      stampSpanInput(span, {
+        emailId: email.id,
+        subject: email.subject,
+        from: email.from,
+        date: email.date,
+        source,
+        // Keep body off the entry span (PII); LLM child carries the prompt.
+      });
 
-const runInvoiceAgentImpl = async (
+      const combinedText = [
+        email.subject,
+        email.snippet,
+        email.bodyText,
+        ...email.attachmentTexts,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const llm = await analyzeEmailWithLlm({
+        subject: email.subject,
+        from: email.from,
+        date: email.date,
+        text: combinedText,
+      });
+
+      const finalOutput = toFinalOutput(llm);
+      stampSpanOutput(span, finalOutput);
+
+      if (!llm.isInvoice) return null;
+
+      return {
+        id: `${source}-${email.id}`,
+        emailId: email.id,
+        threadId: email.threadId || undefined,
+        subject: email.subject,
+        from: email.from,
+        vendor: llm.vendor || "Unknown vendor",
+        receivedAt: new Date(email.date).toISOString(),
+        amount:
+          llm.amount != null
+            ? {
+                value: llm.amount,
+                currency: llm.currency || "USD",
+                raw: `${llm.currency || "USD"} ${llm.amount}`,
+              }
+            : null,
+        dueDate: llm.dueDate,
+        invoiceNumber: llm.invoiceNumber,
+        confidence: finalOutput.confidence,
+        summary: llm.summary || email.snippet || email.subject,
+        gmailUrl: toGmailUrl(email.id, source),
+        source,
+      };
+    },
+  );
+
+export const runInvoiceAgent = async (
   emails: RawEmail[],
   source: "gmail" | "demo",
 ) => {
@@ -99,27 +111,4 @@ const runInvoiceAgentImpl = async (
   });
 
   return invoices;
-};
-
-export const runInvoiceAgent = async (
-  emails: RawEmail[],
-  source: "gmail" | "demo",
-) => {
-  ensureOvermindTracing();
-  const tracer = trace.getTracer("ledgerline-invoice-triage");
-  return tracer.startActiveSpan("Batch invoice agent orchestrator", async (span) => {
-    span.setAttribute("overmind.span.type", "entry_point");
-    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
-    span.setAttribute("inputs", JSON.stringify({ emailCount: emails.length, source }));
-    try {
-      const result = await runInvoiceAgentImpl(emails, source);
-      span.setAttribute("outputs", JSON.stringify({ invoiceCount: result.length }));
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    }
-  });
 };

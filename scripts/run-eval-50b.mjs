@@ -41,6 +41,7 @@ if (!process.env.OPENAI_API_KEY && !process.env.OLLAMA_BASE_URL) {
 const { EVAL_SCENARIOS_B_50 } = await import("../src/lib/eval-emails-b.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
+const { shutdownOvermindTracing } = await import("../src/lib/overmind.ts");
 
 if (EVAL_SCENARIOS_B_50.length !== 50) {
   console.error(
@@ -67,6 +68,7 @@ for (let i = 0; i < EVAL_SCENARIOS_B_50.length; i += 1) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Hard failure on ${email.id}: ${message}`);
+    await shutdownOvermindTracing();
     process.exit(1);
   }
 
@@ -109,4 +111,5 @@ if (misses.length) {
   }
 }
 
+await shutdownOvermindTracing();
 process.exit(0);

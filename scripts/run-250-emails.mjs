@@ -42,6 +42,7 @@ const count = Number(process.env.DEMO_EMAIL_COUNT || 250);
 const { generateDemoEmails } = await import("../src/lib/generate-demo-emails.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
+const { shutdownOvermindTracing } = await import("../src/lib/overmind.ts");
 
 const emails = generateDemoEmails(count);
 if (emails.length !== count) {
@@ -67,6 +68,7 @@ for (let i = 0; i < emails.length; i += 1) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Hard failure on ${email.id}: ${message}`);
+    await shutdownOvermindTracing();
     process.exit(1);
   }
 
@@ -107,4 +109,5 @@ for (const row of invoiceRows.slice(0, 10)) {
   );
 }
 
+await shutdownOvermindTracing();
 process.exit(0);

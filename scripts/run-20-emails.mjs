@@ -41,6 +41,7 @@ if (!process.env.OPENAI_API_KEY && !process.env.OLLAMA_BASE_URL) {
 const { DEMO_EMAILS } = await import("../src/lib/demo-emails.ts");
 const { analyzeEmail } = await import("../src/lib/agent/triage.ts");
 const { getLlmStatus } = await import("../src/lib/agent/llm.ts");
+const { shutdownOvermindTracing } = await import("../src/lib/overmind.ts");
 
 if (DEMO_EMAILS.length !== 20) {
   console.error(
@@ -63,6 +64,7 @@ for (const email of DEMO_EMAILS) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Hard failure on ${email.id}: ${message}`);
+    await shutdownOvermindTracing();
     process.exit(1);
   }
 
@@ -85,4 +87,5 @@ console.log(
   `  Rejected / non-invoices: ${DEMO_EMAILS.length - invoiceRows.length}`,
 );
 
+await shutdownOvermindTracing();
 process.exit(0);

@@ -1,8 +1,7 @@
-import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { analyzeEmailWithLlm } from "@/lib/agent/llm";
 import { generateDemoEmails } from "@/lib/generate-demo-emails";
 import type { RawEmail } from "@/lib/gmail";
-import { ensureOvermindTracing } from "@/lib/overmind";
+import { stampSpanInput, stampSpanOutput, withSpan } from "@/lib/overmind";
 import type { InvoiceRecord } from "@/lib/types";
 
 /**
@@ -446,25 +445,53 @@ const analyzeThemesEmailImpl = async (
 
 export const analyzeThemesEmail = async (
   item: ThemesCorpusItem,
-): Promise<ThemesAnalyzeResult> => {
-  ensureOvermindTracing();
-  const tracer = trace.getTracer("ledgerline-invoice-triage");
-  return tracer.startActiveSpan("Themes corpus harness entrypoint", async (span) => {
-    span.setAttribute("overmind.span.type", "entry_point");
-    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
-    span.setAttribute("inputs", JSON.stringify({ emailId: item.email.id, mode: item.mode }));
-    try {
+): Promise<ThemesAnalyzeResult> =>
+  withSpan(
+    "analyzeThemesEmail",
+    "entry_point",
+    {
+      "email.id": item.email.id,
+      "theme.mode": item.mode,
+    },
+    async (span) => {
+      stampSpanInput(span, {
+        emailId: item.email.id,
+        subject: item.email.subject,
+        mode: item.mode,
+      });
       const result = await analyzeThemesEmailImpl(item);
-      span.setAttribute("outputs", JSON.stringify(result));
-      span.setStatus({ code: SpanStatusCode.OK });
+      const record = result.record;
+      stampSpanOutput(
+        span,
+        result.ok
+          ? {
+              isInvoice: result.isInvoice,
+              vendor: record?.vendor ?? null,
+              amount: record?.amount?.value ?? null,
+              currency: record?.amount?.currency ?? null,
+              dueDate: record?.dueDate ?? null,
+              invoiceNumber: record?.invoiceNumber ?? null,
+              summary: record?.summary ?? null,
+              confidence: record?.confidence ?? null,
+              ok: result.ok,
+              error: result.error,
+            }
+          : {
+              isInvoice: false,
+              vendor: null,
+              amount: null,
+              currency: null,
+              dueDate: null,
+              invoiceNumber: null,
+              summary: null,
+              confidence: null,
+              ok: false,
+              error: result.error,
+            },
+      );
       return result;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    }
-  });
-};
+    },
+  );
 
 export const tallyModes = (items: ThemesCorpusItem[]) => {
   const counts = new Map<ThemeFailureMode, number>();

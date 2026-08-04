@@ -52,6 +52,7 @@ const {
   generateThemesCorpus,
   tallyModes,
 } = await import("../src/lib/themes-corpus.ts");
+const { shutdownOvermindTracing } = await import("../src/lib/overmind.ts");
 
 const { items, modeByEmailId } = generateThemesCorpus(count);
 if (items.length !== count) {
@@ -129,4 +130,5 @@ for (const mode of [...byMode.keys()].sort()) {
   console.log(`  ${mode}: ${n}`);
 }
 
+await shutdownOvermindTracing();
 process.exit(0);

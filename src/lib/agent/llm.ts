@@ -1,6 +1,12 @@
-import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { z } from "zod";
-import { ensureOvermindTracing } from "@/lib/overmind";
+import {
+  stampSpanOutput,
+  toGenAiPartsMessages,
+  withSpan,
+} from "@/lib/overmind";
+
+/** Max chars of email body/attachments included in the user prompt. */
+export const LLM_BODY_TRUNCATE_CHARS = 10000;
 
 const LlmExtractionSchema = z.object({
   isInvoice: z.boolean(),
@@ -115,7 +121,7 @@ const extractJsonObject = (content: string) => {
   return JSON.parse(match[0]) as unknown;
 };
 
-const fetchLlmExtractionImpl = async (input: {
+export const analyzeEmailWithLlm = async (input: {
   subject: string;
   from: string;
   date: string;
@@ -147,159 +153,114 @@ Email date: ${input.date}
 Email subject: ${input.subject}
 From: ${input.from}
 Body / attachments text:
-${input.text.slice(0, 10000)}`;
+${input.text.slice(0, LLM_BODY_TRUNCATE_CHARS)}`;
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: userPrompt },
   ];
 
-  const response = await fetch(endpoint.url, {
-    method: "POST",
-    headers: endpoint.headers,
-    body: JSON.stringify({
-      model: endpoint.model,
-      temperature,
-      messages,
-      response_format: { type: "json_object" },
-    }),
-  });
+  // Explicit llm_call around raw fetch — OpenAI SDK patch does not cover this path.
+  return withSpan(
+    "analyzeEmailWithLlm",
+    "llm_call",
+    {
+      "gen_ai.request.model": endpoint.model,
+      "gen_ai.system": endpoint.provider,
+      "genai.provider": endpoint.provider,
+      "genai.model": endpoint.model,
+      // Mechanically checkable request params for Overmind card-constraints.
+      "gen_ai.request.temperature": temperature,
+      "gen_ai.request.response_format": "json_object",
+      "gen_ai.request.max_input_chars": LLM_BODY_TRUNCATE_CHARS,
+    },
+    async (span) => {
+      // Overmind parses gen_ai.*.messages as parts-based semconv, not {role,content}.
+      span.setAttribute("gen_ai.input.messages", toGenAiPartsMessages(messages));
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
-    );
-  }
+      const response = await fetch(endpoint.url, {
+        method: "POST",
+        headers: endpoint.headers,
+        body: JSON.stringify({
+          model: endpoint.model,
+          temperature,
+          messages,
+          response_format: { type: "json_object" },
+        }),
+      });
 
-  const data = (await response.json()) as {
-    choices?: Array<{
-      message?: { content?: string };
-    }>;
-    usage?: {
-      prompt_tokens?: number;
-      completion_tokens?: number;
-      total_tokens?: number;
-    };
-  };
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(
+          `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
+        );
+      }
 
-  const activeSpan = trace.getActiveSpan();
-  if (activeSpan) {
-    activeSpan.setAttribute("gen_ai.request.model", endpoint.model);
-    activeSpan.setAttribute("prompt", JSON.stringify(messages));
-    if (data.usage?.prompt_tokens != null) {
-      activeSpan.setAttribute(
-        "gen_ai.usage.input_tokens",
-        data.usage.prompt_tokens,
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: { content?: string };
+        }>;
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+        };
+      };
+
+      const rawContent = data.choices?.[0]?.message?.content;
+      if (!rawContent) {
+        throw new Error("LLM returned an empty response.");
+      }
+
+      span.setAttribute(
+        "gen_ai.output.messages",
+        toGenAiPartsMessages([{ role: "assistant", content: rawContent }]),
       );
-    }
-    if (data.usage?.completion_tokens != null) {
-      activeSpan.setAttribute(
-        "gen_ai.usage.output_tokens",
-        data.usage.completion_tokens,
-      );
-    }
-    if (data.usage?.total_tokens != null) {
-      activeSpan.setAttribute(
-        "gen_ai.usage.total_tokens",
-        data.usage.total_tokens,
-      );
-    }
-  }
+      if (data.usage?.prompt_tokens != null) {
+        span.setAttribute("gen_ai.usage.input_tokens", data.usage.prompt_tokens);
+        span.setAttribute("gen_ai.usage.prompt_tokens", data.usage.prompt_tokens);
+      }
+      if (data.usage?.completion_tokens != null) {
+        span.setAttribute(
+          "gen_ai.usage.output_tokens",
+          data.usage.completion_tokens,
+        );
+        span.setAttribute(
+          "gen_ai.usage.completion_tokens",
+          data.usage.completion_tokens,
+        );
+      }
+      if (data.usage?.total_tokens != null) {
+        span.setAttribute("gen_ai.usage.total_tokens", data.usage.total_tokens);
+      }
 
-  const rawContent = data.choices?.[0]?.message?.content;
-  if (!rawContent) {
-    throw new Error("LLM returned an empty response.");
-  }
+      const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
 
-  const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
+      // Some models return confidence as 0–100; normalize to 0–1 for the schema.
+      if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
+        parsed.confidence = Math.min(parsed.confidence / 100, 1);
+      }
 
-  // Some models return confidence as 0–100; normalize to 0–1 for the schema.
-  if (typeof parsed.confidence === "number" && parsed.confidence > 1) {
-    parsed.confidence = Math.min(parsed.confidence / 100, 1);
-  }
+      const result = LlmExtractionSchema.safeParse(parsed);
+      if (!result.success) {
+        throw new Error(
+          `LLM returned invalid invoice JSON: ${result.error.message}`,
+        );
+      }
 
-  const result = LlmExtractionSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new Error(
-      `LLM returned invalid invoice JSON: ${result.error.message}`,
-    );
-  }
+      // Also stamp structured extraction on the llm_call for trajectory scorers.
+      stampSpanOutput(span, {
+        isInvoice: result.data.isInvoice,
+        vendor: result.data.vendor,
+        amount: result.data.amount,
+        currency: result.data.currency,
+        dueDate: result.data.dueDate,
+        invoiceNumber: result.data.invoiceNumber,
+        summary: result.data.summary,
+        confidence: Number(result.data.confidence.toFixed(2)),
+      });
 
-  return result.data;
-};
-
-const fetchLlmExtraction = async (input: {
-  subject: string;
-  from: string;
-  date: string;
-  text: string;
-}): Promise<LlmExtraction> => {
-  ensureOvermindTracing();
-  const tracer = trace.getTracer("ledgerline-invoice-triage");
-  return tracer.startActiveSpan("Raw LLM HTTP fetch", async (span) => {
-    span.setAttribute("overmind.span.type", "function");
-    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
-    span.setAttribute("inputs", JSON.stringify(input));
-    try {
-      const result = await fetchLlmExtractionImpl(input);
-      span.setAttribute("outputs", JSON.stringify(result));
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    }
-  });
-};
-
-const analyzeEmailWithLlmImpl = async (input: {
-  subject: string;
-  from: string;
-  date: string;
-  text: string;
-}): Promise<LlmExtraction> => {
-  ensureOvermindTracing();
-  const tracer = trace.getTracer("ledgerline-invoice-triage");
-  return tracer.startActiveSpan("Internal LLM fetch implementation", async (span) => {
-    span.setAttribute("overmind.span.type", "function");
-    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
-    span.setAttribute("inputs", JSON.stringify(input));
-    try {
-      const result = await fetchLlmExtraction(input);
-      span.setAttribute("outputs", JSON.stringify(result));
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    }
-  });
-};
-
-export const analyzeEmailWithLlm = async (input: {
-  subject: string;
-  from: string;
-  date: string;
-  text: string;
-}): Promise<LlmExtraction> => {
-  ensureOvermindTracing();
-  const tracer = trace.getTracer("ledgerline-invoice-triage");
-  return tracer.startActiveSpan("Ledgerline Invoice Triage Agent", async (span) => {
-    span.setAttribute("overmind.span.type", "entry_point");
-    span.setAttribute("overmind.agent.name", "Ledgerline Invoice Triage Agent");
-    span.setAttribute("inputs", JSON.stringify(input));
-    try {
-      const result = await analyzeEmailWithLlmImpl(input);
-      span.setAttribute("outputs", JSON.stringify(result));
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    }
-  });
+      return result.data;
+    },
+  );
 };
