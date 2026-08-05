@@ -1,3 +1,4 @@
+import { traceEntryPoint, traceLlmCall } from "@/lib/telemetry";
 import { z } from "zod";
 
 const LlmExtractionSchema = z.object({
@@ -113,7 +114,9 @@ const extractJsonObject = (content: string) => {
   return JSON.parse(match[0]) as unknown;
 };
 
-export const analyzeEmailWithLlm = async (input: {
+export const analyzeEmailWithLlm = traceEntryPoint(
+  "Ledgerline Invoice Triage Agent",
+  async (input: {
   subject: string;
   from: string;
   date: string;
@@ -152,34 +155,52 @@ ${input.text.slice(0, 10000)}`;
     { role: "user", content: userPrompt },
   ];
 
-  const response = await fetch(endpoint.url, {
-    method: "POST",
-    headers: endpoint.headers,
-    body: JSON.stringify({
+  const { rawContent } = await traceLlmCall(
+    {
       model: endpoint.model,
       temperature,
+      responseFormat: "json_object",
+      maxInputChars: 10000,
       messages,
-      response_format: { type: "json_object" },
-    }),
-  });
+    },
+    async () => {
+      const response = await fetch(endpoint.url, {
+        method: "POST",
+        headers: endpoint.headers,
+        body: JSON.stringify({
+          model: endpoint.model,
+          temperature,
+          messages,
+          response_format: { type: "json_object" },
+        }),
+      });
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
-    );
-  }
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(
+          `LLM request failed (${response.status}): ${errorText.slice(0, 240) || response.statusText}`,
+        );
+      }
 
-  const data = (await response.json()) as {
-    choices?: Array<{
-      message?: { content?: string };
-    }>;
-  };
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: { content?: string };
+        }>;
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+        };
+      };
 
-  const rawContent = data.choices?.[0]?.message?.content;
-  if (!rawContent) {
-    throw new Error("LLM returned an empty response.");
-  }
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error("LLM returned an empty response.");
+      }
+
+      return { rawContent: content, usage: data.usage };
+    },
+  );
 
   const parsed = extractJsonObject(rawContent) as Record<string, unknown>;
 
@@ -196,4 +217,11 @@ ${input.text.slice(0, 10000)}`;
   }
 
   return result.data;
-};
+  },
+  (input) => ({
+    subject: input.subject,
+    from: input.from,
+    date: input.date,
+    textLength: input.text.length,
+  }),
+);
